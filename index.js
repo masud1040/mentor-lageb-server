@@ -13,9 +13,30 @@ const port = process.env.PORT || 5000;
 app.use(express.json());
 app.use(cors());
 
-// HireLoop এর স্টাইলে MongoDB কানেকশন
+//MongoDB কানেকশন
 const client = new MongoClient(process.env.MONGODB_URL);
 
+export async function connectToMongoDB() {
+    try {
+        await client.connect();
+        console.log("You successfully connected to MongoDB!");
+        return client;
+    } catch (err) {
+        console.dir(err);
+    }
+}
+//all db 
+const connectedClient = await connectToMongoDB();
+const database = connectedClient.db("mentorlagbedb");
+const users = database.collection("users");
+const sessions = database.collection("sessions");
+const tuitions = database.collection("tuitions");
+const applications = database.collection("applications");
+const payments = database.collection("payments");
+
+app.get('/', (req, res) => {
+    res.send('MentorLagbe backend is looping and running!')
+})
 
 
 app.listen(port, () => {

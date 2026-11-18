@@ -321,44 +321,44 @@ app.patch('/tuitions/:id', verifyToken, verifyMentor, async (req, res) => {
 });
 
 // Admin: Approve, Reject, or Re-approve tuition post
-// app.patch(
-//   '/admin/tuitions/:id/status',
-//   verifyToken,
-//   verifyAdmin,
-//   async (req, res) => {
-//     try {
-//       const id = req.params.id;
-//       const { adminStatus } = req.body; // 'approved' | 'rejected' | 'pending'
+app.patch(
+  '/admin/tuitions/:id/status',
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const { adminStatus } = req.body; // 'approved' | 'rejected' | 'pending'
 
-//       if (!ObjectId.isValid(id)) {
-//         return res
-//           .status(400)
-//           .send({ success: false, message: 'Invalid tuition ID' });
-//       }
-//       if (!['approved', 'rejected', 'pending'].includes(adminStatus)) {
-//         return res
-//           .status(400)
-//           .send({ success: false, message: 'Invalid status value' });
-//       }
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .send({ success: false, message: 'Invalid tuition ID' });
+      }
+      if (!['approved', 'rejected', 'pending'].includes(adminStatus)) {
+        return res
+          .status(400)
+          .send({ success: false, message: 'Invalid status value' });
+      }
 
-//       const result = await tuitions.updateOne(
-//         { _id: new ObjectId(id) },
-//         {
-//           $set: {
-//             adminStatus,
-//             updatedAt: new Date(),
-//           },
-//         }
-//       );
+      const result = await tuitions.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            adminStatus,
+            updatedAt: new Date(),
+          },
+        }
+      );
 
-//       res.send({ success: true, result });
-//     } catch (error) {
-//       res
-//         .status(500)
-//         .send({ success: false, message: 'Failed to update admin status' });
-//     }
-//   }
-// );
+      res.send({ success: true, result });
+    } catch (error) {
+      res
+        .status(500)
+        .send({ success: false, message: 'Failed to update admin status' });
+    }
+  }
+);
 
 // Delete tuition post (Mentor own post OR Admin any post)
 app.delete('/tuitions/:id', verifyToken, async (req, res) => {

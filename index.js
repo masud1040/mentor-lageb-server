@@ -93,6 +93,34 @@ const verifyAdmin = async (req, res, next) => {
     next();
 }
 
+// ==================== USERS RELATED APIS ====================
+app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
+    const cursor = users.find({});
+    const result = await cursor.toArray();
+    res.send(result);
+})
+
+app.get('/users/:id/premium', async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const result = await users.findOne(query, { projection: { isPremium: 1 } });
+    res.send(result);
+})
+
+app.patch('/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const updatedDoc = {
+        $set: {
+            role: req.body.role,
+        }
+    }
+    const result = await users.updateOne(query, updatedDoc);
+    res.send(result);
+})
+
+
+
 app.listen(port, () => {
     console.log(`MentorLagbe backend is running on port ${port}`)
 })

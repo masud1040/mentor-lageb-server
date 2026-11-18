@@ -219,6 +219,67 @@ app.delete('/tuitions/:id', verifyToken, verifyMentor, async (req, res) => {
 })
 
 
+// ==================== APPLICATIONS RELATED APIS ====================
+app.get('/applications', verifyToken, async (req, res) => {
+    const query = {};
+    if (req.query.applicantId) {
+        query.userId = req.query.applicantId;
+    }
+    if (req.query.tuitionId) {
+        const tuitionQuery = { _id: new ObjectId(req.query.tuitionId) };
+        const tuition = await tuitions.findOne(tuitionQuery);
+        
+        if (tuition.authorId !== req.user._id.toString() && req.user.role !== 'admin') {
+            res.status(403).send({ message: 'Forbidden' });
+            return;
+        }
+        query.tuitionId = req.query.tuitionId;
+    }
+    const cursor = applications.find(query);
+    const result = await cursor.toArray();
+    res.send(result);
+})
+
+// Apply for a tuition (Student only)
+app.post('/applications', verifyToken, verifyStudent, async (req, res) => {
+    const application = req.body;
+    
+    // Check if tuition is active and open
+    const tuition = await tuitions.findOne({ _id: new ObjectId(application.tuitionId) });
+    if (!tuition || tuition.status !== 'active') {
+        return res.status(400).send({ success: false, message: 'This tuition post is closed or unavailable.' });
+    }
+
+    const result = await applications.insertOne({
+        ...application,
+        userId: req.user._id.toString(),
+        status: 'pending',
+        appliedAt: new Date()
+    });
+
+    // Increment applicants count
+    await tuitions.updateOne(
+        { _id: new ObjectId(application.tuitionId) },
+        { $inc: { applicantsCount: 1 } }
+    );
+
+    res.send(result);
+})
+
+// Update application status (Mentor/Admin)
+app.patch('/applications/:id', verifyToken, async (req, res) => {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const updatedDoc = {
+        $set: {
+            status: req.body.status, // accepted / rejected
+        }
+    }
+    const result = await applications.updateOne(query, updatedDoc);
+    res.send(result);
+})
+
+
 
 
 app.listen(port, () => {

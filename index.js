@@ -200,7 +200,7 @@ app.patch('/users/:id/ban', verifyToken, verifyAdmin, async (req, res) => {
 
     const filter = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { _id: id };
     const result = await users.updateOne(filter, {
-      $set: { banned: Boolean(banned), updatedAt: new Date() },
+      $set: { banned: Boolean(banned), updatedAt: new Dat+e() },
     });
 
     res.send({ success: true, result });
@@ -466,12 +466,14 @@ app.post('/applications', verifyToken, verifyStudent, async (req, res) => {
       });
     }
 
-    // Check duplicate application
-    const alreadyApplied = await applications.findOne({
+
+    const activeApplication = await applications.findOne({
       tuitionId: application.tuitionId,
       userId: studentId,
+      status: { $ne: 'rejected' },
     });
-    if (alreadyApplied) {
+
+    if (activeApplication) {
       return res.status(400).send({
         success: false,
         message: 'You have already applied for this tuition.',
@@ -498,7 +500,6 @@ app.post('/applications', verifyToken, verifyStudent, async (req, res) => {
     res.status(500).send({ success: false, message: 'Failed to apply' });
   }
 });
-
 // Update application status (Mentor/Admin)
 app.patch('/applications/:id', verifyToken, async (req, res) => {
   try {

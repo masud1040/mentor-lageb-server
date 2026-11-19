@@ -186,6 +186,29 @@ app.patch('/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+// Block / Unblock user (Admin only)
+app.patch('/users/:id/ban', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { banned } = req.body; // true | false
+
+    if (req.user._id.toString() === id) {
+      return res
+        .status(400)
+        .send({ success: false, message: 'You cannot block your own account.' });
+    }
+
+    const filter = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { _id: id };
+    const result = await users.updateOne(filter, {
+      $set: { banned: Boolean(banned), updatedAt: new Date() },
+    });
+
+    res.send({ success: true, result });
+  } catch (error) {
+    res.status(500).send({ success: false, message: 'Failed to update ban status' });
+  }
+});
+
 // ==================== TUITION POSTS RELATED APIS ====================
 
 // Get all tuitions (Filters, Search, Budget Range & Limit)

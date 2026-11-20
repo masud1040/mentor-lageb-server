@@ -512,6 +512,9 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
       tuitionTitle: tuition.title,
       status: "pending", // pending | accepted | rejected
       appliedAt: new Date(),
+      studentClass: req.user.studentClass || '',
+      studentInstitution: req.user.institution || '',
+      studentLocation: req.user.location || '',
     });
 
     await tuitions.updateOne(
@@ -604,6 +607,7 @@ app.patch('/users/me/profile', verifyToken, async (req, res) => {
 });
 
 // 2. Public: Get all mentors (with search & subject filter)
+// 2. Public: Get all mentors (with search, subject, sort=top & limit)
 app.get('/mentors', async (req, res) => {
   try {
     const query = {
@@ -644,19 +648,69 @@ app.get('/mentors', async (req, res) => {
       .sort({ isPremium: -1, createdAt: -1 })
       .toArray();
 
-    // Protiti mentor-er approved post count add kora
     const enriched = await Promise.all(
       mentorList.map(async (m) => {
-        const postsCount = await tuitions.countDocuments({
-          $or: [{ authorId: m._id.toString() }, { authorEmail: m.email }],
-          adminStatus: 'approved',
-          status: 'active',
-        });
-        return { ...m, postsCount };
+        const mentorTuitions = await tuitions
+          .find(
+            {
+              $or: [{ authorId: m._id.toString() }, { authorEmail: m.email }],
+            },
+            { projection: { _id: 1, status: 1, adminStatus: 1 } }
+          )
+          .toArray();
+
+        const postsCount = mentorTuitions.filter(
+          (t) => t.adminStatus === 'approved' && t.status === 'active'
+        ).length;
+
+        const tuitionIds = mentorTuitions.map((t) => t._id.toString());
+
+        let studentsCount = 0;
+        let applicantsCount = 0;
+
+        if (tuitionIds.length > 0) {
+          const acceptedUserIds = await applications.distinct('userId', {
+            tuitionId: { $in: tuitionIds },
+            status: 'accepted',
+          });
+          studentsCount = acceptedUserIds.length;
+
+          applicantsCount = await applications.countDocuments({
+            tuitionId: { $in: tuitionIds },
+            status: { $ne: 'rejected' },
+          });
+        }
+
+        return {
+          ...m,
+          postsCount,
+          studentsCount,
+          applicantsCount,
+        };
       })
     );
 
-    res.send(enriched);
+    // Home page-er Top Mentors ranking: Beshi student -> Beshi applicant -> Beshi post -> Pro
+    if (req.query.sort === 'top') {
+      enriched.sort((a, b) => {
+        if (b.studentsCount !== a.studentsCount) {
+          return b.studentsCount - a.studentsCount;
+        }
+        if (b.applicantsCount !== a.applicantsCount) {
+          return b.applicantsCount - a.applicantsCount;
+        }
+        if (b.postsCount !== a.postsCount) {
+          return b.postsCount - a.postsCount;
+        }
+        return Number(Boolean(b.isPremium)) - Number(Boolean(a.isPremium));
+      });
+    }
+
+    const limit = parseInt(req.query.limit, 10);
+    const finalResult =
+      !isNaN(limit) && limit > 0 ? enriched.slice(0, limit) : enriched;
+
+    res.send(finalResult);
   } catch (error) {
     console.error('Get Mentors Error:', error);
     res.status(500).send({ message: 'Failed to fetch mentors' });

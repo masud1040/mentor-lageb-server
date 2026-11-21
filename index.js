@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import cookieParser from "cookie-parser";
+import jwt from "jsonwebtoken";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
@@ -9,13 +11,17 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const JWT_SECRET =
+  process.env.JWT_SECRET || "mentorlagbe_fallback_jwt_secret_change_in_env";
 
 // ==================== MIDDLEWARES ====================
 app.use(express.json());
+app.use(cookieParser());
 app.use(
   cors({
     origin: [CLIENT_URL, "http://localhost:3000"],
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 
@@ -45,48 +51,126 @@ app.get("/", (req, res) => {
   res.send("MentorLagbe backend is running!");
 });
 
+// ==================== HELPER: RESOLVE BETTERAUTH SESSION ====================
+async function getUserFromBetterAuthCookie(req) {
+  let rawToken =
+    req.cookies?.["better-auth.session_token"] ||
+    req.cookies?.["__Secure-better-auth.session_token"] ||
+    null;
+
+  if (!rawToken && req.headers.cookie) {
+    const cookies = Object.fromEntries(
+      req.headers.cookie.split(";").map((c) => {
+        const [key, ...v] = c.trim().split("=");
+        return [key, decodeURIComponent(v.join("="))];
+      }),
+    );
+    rawToken =
+      cookies["better-auth.session_token"] ||
+      cookies["__Secure-better-auth.session_token"];
+  }
+
+  if (!rawToken) return null;
+
+  const token = rawToken.split(".")[0];
+  const session = await sessions.findOne({ token });
+  if (!session) return null;
+
+  const userId = session.userId;
+  const user =
+    (await users.findOne({ _id: userId })) ||
+    (ObjectId.isValid(userId)
+      ? await users.findOne({ _id: new ObjectId(userId) })
+      : null);
+
+  return user || null;
+}
+
+// ==================== JWT ISSUE ENDPOINT ====================
+// Client calls POST /jwt after login / session load to obtain a signed JWT
+app.post("/jwt", async (req, res) => {
+  try {
+    const user = await getUserFromBetterAuthCookie(req);
+
+    if (!user) {
+      return res
+        .status(401)
+        .send({ success: false, message: "Unauthorized: No active session" });
+    }
+
+    const payload = {
+      userId: user._id.toString(),
+      email: user.email,
+      role: user.role || "student",
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+
+    res.send({
+      success: true,
+      token,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        isPremium: Boolean(user.isPremium),
+      },
+    });
+  } catch (error) {
+    console.error("JWT Issue Error:", error);
+    res
+      .status(500)
+      .send({ success: false, message: "Failed to generate JWT token" });
+  }
+});
+
 // ==================== AUTH & ROLE MIDDLEWARES ====================
 const verifyToken = async (req, res, next) => {
   try {
-    let rawToken = null;
+    const cookieUser = await getUserFromBetterAuthCookie(req);
+    let user = null;
 
-    // 1. Authorization header theke token check
     if (req.headers.authorization?.startsWith("Bearer ")) {
-      rawToken = req.headers.authorization.split(" ")[1];
+      const bearerToken = req.headers.authorization.split(" ")[1];
+      if (bearerToken && bearerToken !== "null" && bearerToken !== "undefined") {
+        try {
+          const decoded = jwt.verify(bearerToken, JWT_SECRET);
+          if (decoded?.userId) {
+            user =
+              (await users.findOne({ _id: decoded.userId })) ||
+              (ObjectId.isValid(decoded.userId)
+                ? await users.findOne({ _id: new ObjectId(decoded.userId) })
+                : null);
+          } else if (decoded?.email) {
+            user = await users.findOne({ email: decoded.email });
+          }
+        } catch {
+          user = null;
+        }
+      }
     }
 
-    // 2. Cookie theke BetterAuth session token check
-    if (!rawToken && req.headers.cookie) {
-      const cookies = Object.fromEntries(
-        req.headers.cookie.split(";").map((c) => {
-          const [key, ...v] = c.trim().split("=");
-          return [key, decodeURIComponent(v.join("="))];
-        }),
-      );
-      rawToken =
-        cookies["better-auth.session_token"] ||
-        cookies["__Secure-better-auth.session_token"];
+    if (user && cookieUser && user._id.toString() !== cookieUser._id.toString()) {
+      return res
+        .status(401)
+        .send({ message: "Unauthorized: Stale JWT token, please refresh" });
     }
-
-    if (!rawToken) {
-      return res.status(401).send({ message: "Unauthorized: No token found" });
-    }
-
-    const token = rawToken.split(".")[0];
-    const session = await sessions.findOne({ token });
-    if (!session) {
-      return res.status(401).send({ message: "Unauthorized: Invalid session" });
-    }
-
-    const userId = session.userId;
-    const user =
-      (await users.findOne({ _id: userId })) ||
-      (ObjectId.isValid(userId)
-        ? await users.findOne({ _id: new ObjectId(userId) })
-        : null);
 
     if (!user) {
-      return res.status(401).send({ message: "Unauthorized: User not found" });
+      user = cookieUser;
+    }
+
+    if (!user) {
+      return res
+        .status(401)
+        .send({ message: "Unauthorized: Invalid or missing token" });
+    }
+
+    if (user.banned) {
+      return res
+        .status(403)
+        .send({ message: "Forbidden: Your account has been suspended" });
     }
 
     req.user = user;
@@ -96,7 +180,6 @@ const verifyToken = async (req, res, next) => {
     return res.status(500).send({ message: "Internal Server Error" });
   }
 };
-
 const verifyStudent = (req, res, next) => {
   if (req.user.role !== "student") {
     return res.status(403).send({ message: "Forbidden: Student access only" });
@@ -105,11 +188,14 @@ const verifyStudent = (req, res, next) => {
 };
 
 const verifyMentor = (req, res, next) => {
-  if (req.user.role !== "mentor") {
+  if (req.user.role !== "mentor" && req.user.role !== "tutor") {
     return res.status(403).send({ message: "Forbidden: Mentor access only" });
   }
   next();
 };
+
+// Alias for Assignment Spec naming compatibility
+const verifyTutor = verifyMentor;
 
 const verifyAdmin = (req, res, next) => {
   if (req.user.role !== "admin") {
@@ -155,15 +241,18 @@ app.get("/users/:id/premium", async (req, res) => {
   try {
     const id = req.params.id;
     const user =
-      (await users.findOne({ _id: id }, { projection: { isPremium: 1 } })) ||
+      (await users.findOne(
+        { _id: id },
+        { projection: { isPremium: 1, plan: 1 } },
+      )) ||
       (ObjectId.isValid(id)
         ? await users.findOne(
             { _id: new ObjectId(id) },
-            { projection: { isPremium: 1 } },
+            { projection: { isPremium: 1, plan: 1 } },
           )
         : null);
 
-    res.send(user || { isPremium: false });
+    res.send(user || { isPremium: false, plan: "free" });
   } catch (error) {
     res.status(500).send({ message: "Failed to check premium status" });
   }
@@ -174,14 +263,16 @@ app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const { role } = req.body;
-    if (!["student", "mentor", "admin"].includes(role)) {
+    if (!["student", "mentor", "tutor", "admin"].includes(role)) {
       return res.status(400).send({ message: "Invalid role" });
     }
 
     const filter = ObjectId.isValid(id)
       ? { _id: new ObjectId(id) }
       : { _id: id };
-    const result = await users.updateOne(filter, { $set: { role } });
+    const result = await users.updateOne(filter, {
+      $set: { role, updatedAt: new Date() },
+    });
     res.send({ success: true, result });
   } catch (error) {
     res.status(500).send({ message: "Failed to update role" });
@@ -205,7 +296,7 @@ app.patch("/users/:id/ban", verifyToken, verifyAdmin, async (req, res) => {
       ? { _id: new ObjectId(id) }
       : { _id: id };
     const result = await users.updateOne(filter, {
-      $set: { banned: Boolean(banned), updatedAt: new Dat() + e() },
+      $set: { banned: Boolean(banned), updatedAt: new Date() },
     });
 
     res.send({ success: true, result });
@@ -218,49 +309,81 @@ app.patch("/users/:id/ban", verifyToken, verifyAdmin, async (req, res) => {
 
 // ==================== TUITION POSTS RELATED APIS ====================
 
-// Get all tuitions (Filters, Search, Budget Range & Limit)
+// Get all tuitions (Filters, Search, Budget Range, Pagination & Limit)
 app.get("/tuitions", async (req, res) => {
   try {
-    const query = {};
+    const andConditions = [];
 
     if (req.query.category && req.query.category !== "all") {
-      query.category = req.query.category;
+      andConditions.push({ category: req.query.category });
     }
     if (req.query.isOnline === "true" || req.query.isOnline === "false") {
-      query.isOnline = req.query.isOnline === "true";
+      andConditions.push({ isOnline: req.query.isOnline === "true" });
     }
     if (req.query.mentorId && req.query.mentorEmail) {
-      query.$or = [
-        { authorId: req.query.mentorId },
-        { authorEmail: req.query.mentorEmail },
-      ];
+      andConditions.push({
+        $or: [
+          { authorId: req.query.mentorId },
+          { authorEmail: req.query.mentorEmail },
+        ],
+      });
     } else if (req.query.mentorId) {
-      query.authorId = req.query.mentorId;
+      andConditions.push({ authorId: req.query.mentorId });
     } else if (req.query.mentorEmail) {
-      query.authorEmail = req.query.mentorEmail;
+      andConditions.push({ authorEmail: req.query.mentorEmail });
     }
     if (req.query.status && req.query.status !== "all") {
-      query.status = req.query.status;
+      andConditions.push({ status: req.query.status });
     }
     if (req.query.adminStatus && req.query.adminStatus !== "all") {
-      query.adminStatus = req.query.adminStatus;
+      andConditions.push({ adminStatus: req.query.adminStatus });
     }
 
     // Budget range filter
     if (req.query.minBudget || req.query.maxBudget) {
-      query.budget = {};
-      if (req.query.minBudget) query.budget.$gte = Number(req.query.minBudget);
-      if (req.query.maxBudget) query.budget.$lte = Number(req.query.maxBudget);
+      const budgetFilter = {};
+      if (req.query.minBudget) budgetFilter.$gte = Number(req.query.minBudget);
+      if (req.query.maxBudget) budgetFilter.$lte = Number(req.query.maxBudget);
+      andConditions.push({ budget: budgetFilter });
     }
 
     // Search filter
     if (req.query.search) {
-      query.$or = [
-        { title: { $regex: req.query.search, $options: "i" } },
-        { subject: { $regex: req.query.search, $options: "i" } },
-        { location: { $regex: req.query.search, $options: "i" } },
-        { description: { $regex: req.query.search, $options: "i" } },
-      ];
+      andConditions.push({
+        $or: [
+          { title: { $regex: req.query.search, $options: "i" } },
+          { subject: { $regex: req.query.search, $options: "i" } },
+          { location: { $regex: req.query.search, $options: "i" } },
+          { description: { $regex: req.query.search, $options: "i" } },
+        ],
+      });
+    }
+
+    const query = andConditions.length > 0 ? { $and: andConditions } : {};
+
+    // Optional Server-Side Pagination (when ?page=1&limit=9 is passed)
+    if (req.query.page) {
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.max(1, parseInt(req.query.limit, 10) || 9);
+      const skip = (page - 1) * limit;
+
+      const [data, total] = await Promise.all([
+        tuitions
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+        tuitions.countDocuments(query),
+      ]);
+
+      return res.send({
+        data,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      });
     }
 
     const limit = req.query.limit ? parseInt(req.query.limit, 10) : 0;
@@ -292,30 +415,39 @@ app.get("/tuitions/:id", async (req, res) => {
   }
 });
 
-// Post new tuition (Mentor only + Free Limit Check: max 2 posts)
-app.post("/tuitions", verifyToken, verifyMentor, async (req, res) => {
+// Post new tuition (Mentor/Tutor only + Free Limit Check: max 2 posts)
+app.post("/tuitions", verifyToken, verifyTutor, async (req, res) => {
   try {
     const tuitionData = req.body;
     const mentorId = req.user._id.toString();
+    const mentorEmail = req.user.email || "";
 
     if (!req.user.isPremium) {
-      const postCount = await tuitions.countDocuments({ authorId: mentorId });
+      const postCount = await tuitions.countDocuments({
+        $or: [
+          { authorId: mentorId },
+          ...(mentorEmail ? [{ authorEmail: mentorEmail }] : []),
+        ],
+      });
+
       if (postCount >= 2) {
         return res.status(403).send({
           success: false,
           requiresPricing: true,
           message:
-            "Free limit exceeded. You can only post a maximum of 2 tuitions. Please upgrade your plan.",
+            "Free limit exceeded. You can only post a maximum of 2 tuitions. Please upgrade to Pro.",
         });
       }
     }
 
     const newTuition = {
       ...tuitionData,
+      image:
+        typeof tuitionData.image === "string" ? tuitionData.image.trim() : "",
       budget: Number(tuitionData.budget) || 0,
       authorId: mentorId,
       authorName: req.user.name || "Mentor",
-      authorEmail: req.user.email || "",
+      authorEmail: mentorEmail,
       status: "active", // active | closed
       adminStatus: "pending", // pending | approved | rejected
       applicantsCount: 0,
@@ -332,14 +464,13 @@ app.post("/tuitions", verifyToken, verifyMentor, async (req, res) => {
 });
 
 // Update tuition (Mentor edits/closes own post)
-app.patch("/tuitions/:id", verifyToken, verifyMentor, async (req, res) => {
+app.patch("/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({ message: "Invalid tuition ID" });
     }
 
-    // Mentor nijera adminStatus change korte parbe na
     const { adminStatus, _id, authorId, authorEmail, ...safeUpdate } = req.body;
 
     const filter = {
@@ -428,6 +559,7 @@ app.delete("/tuitions/:id", verifyToken, async (req, res) => {
     res.status(500).send({ success: false, message: "Failed to delete post" });
   }
 });
+
 // ==================== APPLICATIONS RELATED APIS ====================
 
 app.get("/applications", verifyToken, async (req, res) => {
@@ -447,6 +579,7 @@ app.get("/applications", verifyToken, async (req, res) => {
       if (
         !tuition ||
         (tuition.authorId !== req.user._id.toString() &&
+          tuition.authorEmail !== req.user.email &&
           req.user.role !== "admin")
       ) {
         return res.status(403).send({ message: "Forbidden" });
@@ -512,9 +645,9 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
       tuitionTitle: tuition.title,
       status: "pending", // pending | accepted | rejected
       appliedAt: new Date(),
-      studentClass: req.user.studentClass || '',
-      studentInstitution: req.user.institution || '',
-      studentLocation: req.user.location || '',
+      studentClass: req.user.studentClass || "",
+      studentInstitution: req.user.institution || "",
+      studentLocation: req.user.location || "",
     });
 
     await tuitions.updateOne(
@@ -527,6 +660,7 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
     res.status(500).send({ success: false, message: "Failed to apply" });
   }
 });
+
 // Update application status (Mentor/Admin)
 app.patch("/applications/:id", verifyToken, async (req, res) => {
   try {
@@ -545,16 +679,62 @@ app.patch("/applications/:id", verifyToken, async (req, res) => {
   }
 });
 
+// Cancel/Delete a pending application (Student only)
+app.delete("/applications/:id", verifyToken, verifyStudent, async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .send({ success: false, message: "Invalid application ID" });
+    }
+
+    const existing = await applications.findOne({
+      _id: new ObjectId(id),
+      userId: req.user._id.toString(),
+    });
+
+    if (!existing) {
+      return res
+        .status(404)
+        .send({ success: false, message: "Application not found" });
+    }
+
+    if (existing.status !== "pending") {
+      return res.status(400).send({
+        success: false,
+        message: "Only pending applications can be canceled.",
+      });
+    }
+
+    await applications.deleteOne({ _id: new ObjectId(id) });
+
+    if (existing.tuitionId && ObjectId.isValid(existing.tuitionId)) {
+      await tuitions.updateOne(
+        { _id: new ObjectId(existing.tuitionId), applicantsCount: { $gt: 0 } },
+        { $inc: { applicantsCount: -1 } },
+      );
+    }
+
+    res.send({ success: true, message: "Application canceled successfully." });
+  } catch (error) {
+    res
+      .status(500)
+      .send({ success: false, message: "Failed to cancel application" });
+  }
+});
+
 // ==================== PROFILE & PUBLIC MENTORS APIS ====================
 
-// 1. Update logged-in user's own profile (Mentor & Student both)
-app.patch('/users/me/profile', verifyToken, async (req, res) => {
+// 1. Update logged-in user's own profile (Mentor, Student, Admin)
+app.patch("/users/me/profile", verifyToken, async (req, res) => {
   try {
     const userId = req.user._id;
     const {
       name,
       image,
       bio,
+      phone,
       gender,
       location,
       // Mentor fields
@@ -574,11 +754,13 @@ app.patch('/users/me/profile', verifyToken, async (req, res) => {
     if (name !== undefined) updateFields.name = String(name).trim();
     if (image !== undefined) updateFields.image = String(image).trim();
     if (bio !== undefined) updateFields.bio = String(bio).trim();
+    if (phone !== undefined) updateFields.phone = String(phone).trim();
     if (gender !== undefined) updateFields.gender = String(gender).trim();
     if (location !== undefined) updateFields.location = String(location).trim();
 
-    if (req.user.role === 'mentor') {
-      if (education !== undefined) updateFields.education = String(education).trim();
+    if (req.user.role === "mentor" || req.user.role === "tutor") {
+      if (education !== undefined)
+        updateFields.education = String(education).trim();
       if (currentOccupation !== undefined)
         updateFields.currentOccupation = String(currentOccupation).trim();
       if (cvUrl !== undefined) updateFields.cvUrl = String(cvUrl).trim();
@@ -589,7 +771,7 @@ app.patch('/users/me/profile', verifyToken, async (req, res) => {
       }
     }
 
-    if (req.user.role === 'student') {
+    if (req.user.role === "student") {
       if (studentClass !== undefined)
         updateFields.studentClass = String(studentClass).trim();
       if (institution !== undefined)
@@ -601,31 +783,32 @@ app.patch('/users/me/profile', verifyToken, async (req, res) => {
 
     res.send({ success: true, user: updatedUser });
   } catch (error) {
-    console.error('Update Profile Error:', error);
-    res.status(500).send({ success: false, message: 'Failed to update profile' });
+    console.error("Update Profile Error:", error);
+    res
+      .status(500)
+      .send({ success: false, message: "Failed to update profile" });
   }
 });
 
-// 2. Public: Get all mentors (with search & subject filter)
 // 2. Public: Get all mentors (with search, subject, sort=top & limit)
-app.get('/mentors', async (req, res) => {
+app.get("/mentors", async (req, res) => {
   try {
     const query = {
-      role: 'mentor',
+      role: "mentor",
       banned: { $ne: true },
     };
 
     if (req.query.search) {
       query.$or = [
-        { name: { $regex: req.query.search, $options: 'i' } },
-        { location: { $regex: req.query.search, $options: 'i' } },
-        { education: { $regex: req.query.search, $options: 'i' } },
-        { expertSubjects: { $regex: req.query.search, $options: 'i' } },
+        { name: { $regex: req.query.search, $options: "i" } },
+        { location: { $regex: req.query.search, $options: "i" } },
+        { education: { $regex: req.query.search, $options: "i" } },
+        { expertSubjects: { $regex: req.query.search, $options: "i" } },
       ];
     }
 
-    if (req.query.subject && req.query.subject !== 'all') {
-      query.expertSubjects = { $regex: req.query.subject, $options: 'i' };
+    if (req.query.subject && req.query.subject !== "all") {
+      query.expertSubjects = { $regex: req.query.subject, $options: "i" };
     }
 
     const mentorList = await users
@@ -655,12 +838,12 @@ app.get('/mentors', async (req, res) => {
             {
               $or: [{ authorId: m._id.toString() }, { authorEmail: m.email }],
             },
-            { projection: { _id: 1, status: 1, adminStatus: 1 } }
+            { projection: { _id: 1, status: 1, adminStatus: 1 } },
           )
           .toArray();
 
         const postsCount = mentorTuitions.filter(
-          (t) => t.adminStatus === 'approved' && t.status === 'active'
+          (t) => t.adminStatus === "approved" && t.status === "active",
         ).length;
 
         const tuitionIds = mentorTuitions.map((t) => t._id.toString());
@@ -669,15 +852,15 @@ app.get('/mentors', async (req, res) => {
         let applicantsCount = 0;
 
         if (tuitionIds.length > 0) {
-          const acceptedUserIds = await applications.distinct('userId', {
+          const acceptedUserIds = await applications.distinct("userId", {
             tuitionId: { $in: tuitionIds },
-            status: 'accepted',
+            status: "accepted",
           });
           studentsCount = acceptedUserIds.length;
 
           applicantsCount = await applications.countDocuments({
             tuitionId: { $in: tuitionIds },
-            status: { $ne: 'rejected' },
+            status: { $ne: "rejected" },
           });
         }
 
@@ -687,11 +870,10 @@ app.get('/mentors', async (req, res) => {
           studentsCount,
           applicantsCount,
         };
-      })
+      }),
     );
 
-    // Home page-er Top Mentors ranking: Beshi student -> Beshi applicant -> Beshi post -> Pro
-    if (req.query.sort === 'top') {
+    if (req.query.sort === "top") {
       enriched.sort((a, b) => {
         if (b.studentsCount !== a.studentsCount) {
           return b.studentsCount - a.studentsCount;
@@ -712,23 +894,23 @@ app.get('/mentors', async (req, res) => {
 
     res.send(finalResult);
   } catch (error) {
-    console.error('Get Mentors Error:', error);
-    res.status(500).send({ message: 'Failed to fetch mentors' });
+    console.error("Get Mentors Error:", error);
+    res.status(500).send({ message: "Failed to fetch mentors" });
   }
 });
 
 // 3. Public: Get single mentor profile + their approved tuition posts
-app.get('/mentors/:id', async (req, res) => {
+app.get("/mentors/:id", async (req, res) => {
   try {
     const id = req.params.id;
     const mentor =
-      (await users.findOne({ _id: id, role: 'mentor' })) ||
+      (await users.findOne({ _id: id, role: "mentor" })) ||
       (ObjectId.isValid(id)
-        ? await users.findOne({ _id: new ObjectId(id), role: 'mentor' })
+        ? await users.findOne({ _id: new ObjectId(id), role: "mentor" })
         : null);
 
     if (!mentor) {
-      return res.status(404).send({ message: 'Mentor not found' });
+      return res.status(404).send({ message: "Mentor not found" });
     }
 
     const mentorPosts = await tuitions
@@ -737,8 +919,8 @@ app.get('/mentors/:id', async (req, res) => {
           { authorId: mentor._id.toString() },
           { authorEmail: mentor.email },
         ],
-        adminStatus: 'approved',
-        status: 'active',
+        adminStatus: "approved",
+        status: "active",
       })
       .sort({ createdAt: -1 })
       .toArray();
@@ -762,35 +944,60 @@ app.get('/mentors/:id', async (req, res) => {
       posts: mentorPosts,
     });
   } catch (error) {
-    console.error('Get Single Mentor Error:', error);
-    res.status(500).send({ message: 'Failed to fetch mentor profile' });
+    console.error("Get Single Mentor Error:", error);
+    res.status(500).send({ message: "Failed to fetch mentor profile" });
   }
 });
 
-
-
-
-
-
-
 // ==================== STRIPE PAYMENT APIS ====================
 
-// Create Stripe Checkout Session (Mentor Premium Upgrade)
+// Create Stripe Checkout Session (Both Mentor & Student Pro Upgrade)
 app.post("/payments/create-checkout-session", verifyToken, async (req, res) => {
   try {
-    const { planName = "Mentor Pro Plan", price = 500 } = req.body;
+    const userRole = req.user.role || "student";
+
+    if (userRole === "admin") {
+      return res
+        .status(403)
+        .send({ success: false, message: "Admin accounts do not need Pro." });
+    }
+
+    if (req.user.isPremium) {
+      return res
+        .status(400)
+        .send({ success: false, message: "You are already on the Pro Plan." });
+    }
+
+    const isMentor = userRole === "mentor" || userRole === "tutor";
+    const defaultPlanName = isMentor ? "Mentor Pro Plan" : "Student Pro Plan";
+    const defaultPrice = isMentor ? 500 : 300;
+
+    const {
+      planName = defaultPlanName,
+      price = defaultPrice,
+      successPath,
+      cancelPath,
+    } = req.body;
+
+    const defaultSuccess = isMentor
+      ? "/dashboard/mentor/pricing/success"
+      : "/payment/success";
+    const defaultCancel = isMentor
+      ? "/dashboard/mentor/pricing?canceled=true"
+      : "/payment/cancel";
 
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
       mode: "payment",
       customer_email: req.user.email,
       line_items: [
         {
           price_data: {
-            currency: "usd",
+            currency: "bdt",
             product_data: {
               name: planName,
-              description: "Unlimited tuition posts on MentorLagbe",
+              description: isMentor
+                ? "Unlimited tuition posts & verified Pro badge on MentorLagbe"
+                : "Priority booking & verified Pro Student badge on MentorLagbe",
             },
             unit_amount: Math.round(Number(price) * 100),
           },
@@ -799,10 +1006,11 @@ app.post("/payments/create-checkout-session", verifyToken, async (req, res) => {
       ],
       metadata: {
         userId: req.user._id.toString(),
+        userRole,
         planName,
       },
-      success_url: `${CLIENT_URL}/dashboard/mentor/pricing?success=true&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${CLIENT_URL}/dashboard/mentor/pricing?canceled=true`,
+      success_url: `${CLIENT_URL}${successPath || defaultSuccess}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${CLIENT_URL}${cancelPath || defaultCancel}`,
     });
 
     res.send({ success: true, url: session.url, sessionId: session.id });
@@ -831,7 +1039,15 @@ app.post("/payments/verify-session", verifyToken, async (req, res) => {
 
     const userId = req.user._id.toString();
 
-    // Prevent duplicate payment record
+    if (
+      stripeSession.metadata?.userId &&
+      stripeSession.metadata.userId !== userId
+    ) {
+      return res
+        .status(403)
+        .send({ success: false, message: "Unauthorized payment session" });
+    }
+
     const existingPayment = await payments.findOne({
       stripeSessionId: sessionId,
     });
@@ -839,8 +1055,10 @@ app.post("/payments/verify-session", verifyToken, async (req, res) => {
     if (!existingPayment) {
       await payments.insertOne({
         userId,
+        userName: req.user.name || "User",
         userEmail: req.user.email,
-        planName: stripeSession.metadata?.planName || "Mentor Pro Plan",
+        userRole: req.user.role || "student",
+        planName: stripeSession.metadata?.planName || "Pro Plan",
         amount: stripeSession.amount_total / 100,
         currency: stripeSession.currency,
         stripeSessionId: sessionId,
@@ -849,16 +1067,15 @@ app.post("/payments/verify-session", verifyToken, async (req, res) => {
       });
     }
 
-    // Upgrade user to premium
     const filter = ObjectId.isValid(userId)
       ? { _id: new ObjectId(userId) }
       : { _id: userId };
 
     await users.updateOne(filter, {
-      $set: { isPremium: true, upgradedAt: new Date() },
+      $set: { isPremium: true, plan: "pro", upgradedAt: new Date() },
     });
 
-    res.send({ success: true, message: "Account upgraded to Premium!" });
+    res.send({ success: true, message: "Account upgraded to Pro!" });
   } catch (error) {
     console.error("Stripe Verify Error:", error);
     res
@@ -867,14 +1084,23 @@ app.post("/payments/verify-session", verifyToken, async (req, res) => {
   }
 });
 
-// Get payments history (Admin sees all, user sees own)
+// Get Payments (Admin sees all, Mentor/Student sees own)
 app.get("/payments", verifyToken, async (req, res) => {
   try {
     const query =
-      req.user.role === "admin" ? {} : { userId: req.user._id.toString() };
+      req.user.role === "admin"
+        ? {}
+        : {
+            $or: [
+              { userId: req.user._id.toString() },
+              ...(req.user.email ? [{ userEmail: req.user.email }] : []),
+            ],
+          };
+
     const result = await payments.find(query).sort({ createdAt: -1 }).toArray();
     res.send(result);
   } catch (error) {
+    console.error("Get Payments Error:", error);
     res.status(500).send({ message: "Failed to fetch payments" });
   }
 });

@@ -10,7 +10,9 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const port = process.env.PORT || 5000;
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const CLIENT_URL = (
+  process.env.CLIENT_URL || "https://mentor-lagbe-self.vercel.app"
+).replace(/\/$/, "");
 const JWT_SECRET =
   process.env.JWT_SECRET || "mentorlagbe_fallback_jwt_secret_change_in_env";
 
@@ -19,27 +21,24 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(
   cors({
-    origin: [CLIENT_URL, "http://localhost:3000"],
+    origin: [
+      CLIENT_URL,
+      "https://mentor-lagbe-self.vercel.app",
+      "http://localhost:3000",
+    ],
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 
 // ==================== MONGODB CONNECTION ====================
-const client = new MongoClient(process.env.MONGODB_URL);
+const client = new MongoClient(process.env.MONGODB_URL, {
+  maxPoolSize: 10,
+  serverSelectionTimeoutMS: 10000,
+  socketTimeoutMS: 45000,
+});
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.error("MongoDB Connection Error:", err);
-  }
-}
-
-const connectedClient = await connectToMongoDB();
-const database = connectedClient.db("MentorLagbe");
+const database = client.db("MentorLagbe");
 
 const users = database.collection("user");
 const sessions = database.collection("session");
@@ -87,7 +86,6 @@ async function getUserFromBetterAuthCookie(req) {
 }
 
 // ==================== JWT ISSUE ENDPOINT ====================
-// Client calls POST /jwt after login / session load to obtain a signed JWT
 app.post("/jwt", async (req, res) => {
   try {
     const user = await getUserFromBetterAuthCookie(req);
@@ -180,6 +178,7 @@ const verifyToken = async (req, res, next) => {
     return res.status(500).send({ message: "Internal Server Error" });
   }
 };
+
 const verifyStudent = (req, res, next) => {
   if (req.user.role !== "student") {
     return res.status(403).send({ message: "Forbidden: Student access only" });
@@ -194,7 +193,6 @@ const verifyMentor = (req, res, next) => {
   next();
 };
 
-// Alias for Assignment Spec naming compatibility
 const verifyTutor = verifyMentor;
 
 const verifyAdmin = (req, res, next) => {
@@ -283,7 +281,7 @@ app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
 app.patch("/users/:id/ban", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const { banned } = req.body; // true | false
+    const { banned } = req.body;
 
     if (req.user._id.toString() === id) {
       return res.status(400).send({
@@ -339,7 +337,6 @@ app.get("/tuitions", async (req, res) => {
       andConditions.push({ adminStatus: req.query.adminStatus });
     }
 
-    // Budget range filter
     if (req.query.minBudget || req.query.maxBudget) {
       const budgetFilter = {};
       if (req.query.minBudget) budgetFilter.$gte = Number(req.query.minBudget);
@@ -347,7 +344,6 @@ app.get("/tuitions", async (req, res) => {
       andConditions.push({ budget: budgetFilter });
     }
 
-    // Search filter
     if (req.query.search) {
       andConditions.push({
         $or: [
@@ -361,7 +357,6 @@ app.get("/tuitions", async (req, res) => {
 
     const query = andConditions.length > 0 ? { $and: andConditions } : {};
 
-    // Optional Server-Side Pagination (when ?page=1&limit=9 is passed)
     if (req.query.page) {
       const page = Math.max(1, parseInt(req.query.page, 10) || 1);
       const limit = Math.max(1, parseInt(req.query.limit, 10) || 9);
@@ -448,8 +443,8 @@ app.post("/tuitions", verifyToken, verifyTutor, async (req, res) => {
       authorId: mentorId,
       authorName: req.user.name || "Mentor",
       authorEmail: mentorEmail,
-      status: "active", // active | closed
-      adminStatus: "pending", // pending | approved | rejected
+      status: "active",
+      adminStatus: "pending",
       applicantsCount: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -502,7 +497,7 @@ app.patch(
   async (req, res) => {
     try {
       const id = req.params.id;
-      const { adminStatus } = req.body; // 'approved' | 'rejected' | 'pending'
+      const { adminStatus } = req.body;
 
       if (!ObjectId.isValid(id)) {
         return res
@@ -643,7 +638,7 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
       studentName: req.user.name || "Student",
       studentEmail: req.user.email || "",
       tuitionTitle: tuition.title,
-      status: "pending", // pending | accepted | rejected
+      status: "pending",
       appliedAt: new Date(),
       studentClass: req.user.studentClass || "",
       studentInstitution: req.user.institution || "",
@@ -737,12 +732,10 @@ app.patch("/users/me/profile", verifyToken, async (req, res) => {
       phone,
       gender,
       location,
-      // Mentor fields
       education,
       currentOccupation,
       cvUrl,
       expertSubjects,
-      // Student fields
       studentClass,
       institution,
     } = req.body;
@@ -1105,8 +1098,10 @@ app.get("/payments", verifyToken, async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`MentorLagbe backend is running on port ${port}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`MentorLagbe backend is running on port ${port}`);
+  });
+}
 
 export default app;

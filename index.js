@@ -31,25 +31,38 @@ app.use(
   }),
 );
 
-// ==================== MONGODB CONNECTION ====================
+// ==================== MONGODB CONNECTION (VERCEL SAFE) ====================
 const uri = process.env.MONGODB_URL || process.env.MONGODB_URI;
 const client = new MongoClient(uri, {
-  maxPoolSize: 10,
+  maxPoolSize: 3, // Vercel Serverless + Atlas Free Tier er jonno safe
   serverSelectionTimeoutMS: 10000,
   socketTimeoutMS: 45000,
 });
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (error) {
-    console.error("MongoDB Connection Error:", error);
-    throw error;
+let dbConnectPromise = null;
+
+async function ensureDbConnected() {
+  if (!dbConnectPromise) {
+    dbConnectPromise = client.connect().catch((err) => {
+      dbConnectPromise = null; // Fail hole reset hobe, porer request abar try korbe
+      console.error("MongoDB Connection Error:", err);
+      throw err;
+    });
   }
+  return dbConnectPromise;
 }
-connectToMongoDB();
+
+// Protiti request ashar age নিশ্চিত korbe DB connected ache
+app.use(async (req, res, next) => {
+  try {
+    await ensureDbConnected();
+    next();
+  } catch (error) {
+    res
+      .status(503)
+      .send({ message: "Database temporarily unavailable, please retry." });
+  }
+});
 
 const database = client.db("MentorLagbe");
 
@@ -144,7 +157,11 @@ const verifyToken = async (req, res, next) => {
 
     if (req.headers.authorization?.startsWith("Bearer ")) {
       const bearerToken = req.headers.authorization.split(" ")[1];
-      if (bearerToken && bearerToken !== "null" && bearerToken !== "undefined") {
+      if (
+        bearerToken &&
+        bearerToken !== "null" &&
+        bearerToken !== "undefined"
+      ) {
         try {
           const decoded = jwt.verify(bearerToken, JWT_SECRET);
           if (decoded?.userId) {
@@ -162,7 +179,11 @@ const verifyToken = async (req, res, next) => {
       }
     }
 
-    if (user && cookieUser && user._id.toString() !== cookieUser._id.toString()) {
+    if (
+      user &&
+      cookieUser &&
+      user._id.toString() !== cookieUser._id.toString()
+    ) {
       return res
         .status(401)
         .send({ message: "Unauthorized: Stale JWT token, please refresh" });
@@ -688,49 +709,60 @@ app.patch("/applications/:id", verifyToken, async (req, res) => {
 });
 
 // Cancel/Delete a pending application (Student only)
-app.delete("/applications/:id", verifyToken, verifyStudent, async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
-      return res
-        .status(400)
-        .send({ success: false, message: "Invalid application ID" });
-    }
+app.delete(
+  "/applications/:id",
+  verifyToken,
+  verifyStudent,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .send({ success: false, message: "Invalid application ID" });
+      }
 
-    const existing = await applications.findOne({
-      _id: new ObjectId(id),
-      userId: req.user._id.toString(),
-    });
-
-    if (!existing) {
-      return res
-        .status(404)
-        .send({ success: false, message: "Application not found" });
-    }
-
-    if (existing.status !== "pending") {
-      return res.status(400).send({
-        success: false,
-        message: "Only pending applications can be canceled.",
+      const existing = await applications.findOne({
+        _id: new ObjectId(id),
+        userId: req.user._id.toString(),
       });
+
+      if (!existing) {
+        return res
+          .status(404)
+          .send({ success: false, message: "Application not found" });
+      }
+
+      if (existing.status !== "pending") {
+        return res.status(400).send({
+          success: false,
+          message: "Only pending applications can be canceled.",
+        });
+      }
+
+      await applications.deleteOne({ _id: new ObjectId(id) });
+
+      if (existing.tuitionId && ObjectId.isValid(existing.tuitionId)) {
+        await tuitions.updateOne(
+          {
+            _id: new ObjectId(existing.tuitionId),
+            applicantsCount: { $gt: 0 },
+          },
+          { $inc: { applicantsCount: -1 } },
+        );
+      }
+
+      res.send({
+        success: true,
+        message: "Application canceled successfully.",
+      });
+    } catch (error) {
+      res
+        .status(500)
+        .send({ success: false, message: "Failed to cancel application" });
     }
-
-    await applications.deleteOne({ _id: new ObjectId(id) });
-
-    if (existing.tuitionId && ObjectId.isValid(existing.tuitionId)) {
-      await tuitions.updateOne(
-        { _id: new ObjectId(existing.tuitionId), applicantsCount: { $gt: 0 } },
-        { $inc: { applicantsCount: -1 } },
-      );
-    }
-
-    res.send({ success: true, message: "Application canceled successfully." });
-  } catch (error) {
-    res
-      .status(500)
-      .send({ success: false, message: "Failed to cancel application" });
-  }
-});
+  },
+);
 
 // ==================== PROFILE & PUBLIC MENTORS APIS ====================
 

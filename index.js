@@ -32,11 +32,24 @@ app.use(
 );
 
 // ==================== MONGODB CONNECTION ====================
-const client = new MongoClient(process.env.MONGODB_URL, {
+const uri = process.env.MONGODB_URL || process.env.MONGODB_URI;
+const client = new MongoClient(uri, {
   maxPoolSize: 10,
   serverSelectionTimeoutMS: 10000,
   socketTimeoutMS: 45000,
 });
+
+export async function connectToMongoDB() {
+  try {
+    await client.connect();
+    console.log("You successfully connected to MongoDB!");
+    return client;
+  } catch (error) {
+    console.error("MongoDB Connection Error:", error);
+    throw error;
+  }
+}
+connectToMongoDB();
 
 const database = client.db("MentorLagbe");
 
